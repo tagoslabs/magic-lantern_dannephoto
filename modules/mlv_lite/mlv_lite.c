@@ -378,6 +378,7 @@ static GUARDED_BY(LiveViewTask) int frame_count = 0;                /* how many 
 static GUARDED_BY(LiveViewTask) int skipped_frames = 0;             /* how many frames we had to drop (only done during pre-recording) */
 static GUARDED_BY(RawRecTask)   int chunk_frame_count[MAX_WRITER_THREADS] = {0};          /* how many frames in the current file chunk */
 static volatile                 int buffer_full = 0;                /* true when the memory becomes full */
+static volatile                 int compress_fail_code = 0;        /* lossless encoder error, 0 if none */
        GUARDED_BY(RawRecTask)   char * raw_movie_filename;          /* file name for current (or last) movie */
 static GUARDED_BY(RawRecTask)   char chunk_filename[MAX_WRITER_THREADS][MAX_PATH];          /* file name for current movie chunk */
 static GUARDED_BY(RawRecTask)   int64_t written_total[MAX_WRITER_THREADS] = {0};          /* how many bytes we have written in this movie */
@@ -2761,13 +2762,19 @@ static void compress_task()
                 res_x, res_y
             );
 
-            /* only report compression errors while recording
-             * some of them appear during video mode switches
-             * unlikely to cause actual trouble - silence them for now */
+            /* USB gimbal PTP leaves the JPEG engine half-initialized if
+             * movie LiveView came up with the cable already attached.
+             * Photo -> Movie rebuilds it. Killing compress_task here made
+             * the camera look like it was recording while no frames were saved. */
             if (compressed_size < 0 && !RAW_IS_IDLE)
             {
                 printf("Compression error %d at frame %d\n", compressed_size, frame_count-1);
-                ASSERT(0);
+                DeleteMemorySuite(outSuite);
+                compress_fail_code = compressed_size;
+                buffer_full = 1;
+                /* size is still max_frame_size, so this returns the slot to FREE */
+                free_slot(slot_index);
+                continue;
             }
 
             DeleteMemorySuite(outSuite);
@@ -3380,6 +3387,7 @@ void raw_video_rec_task(uint32_t thread)
         }
         mlv_chunk = 0;
         buffer_full = 0;
+        compress_fail_code = 0;
 
         if (lv_dispsize == 10)
         {
@@ -3729,7 +3737,15 @@ abort_and_check_early_stop:
                 if (cam_100d) ResumeLiveView();
             }
             
-            if (last_block_size > 3)
+            if (compress_fail_code)
+            {
+                bmp_printf( FONT_MED, 30, 90,
+                           "Encoder failed (%d). Switch Photo, then Movie.", compress_fail_code
+                           );
+                NotifyBox(8000, "Encoder failed (%d). Switch Photo, then Movie.", compress_fail_code);
+                beep_times(3);
+            }
+            else if (last_block_size > 3)
             {
                 bmp_printf( FONT_MED, 30, 90,
                            "Early stop (%d). Should have recorded a few more frames.", last_block_size
@@ -3820,7 +3836,12 @@ abort_and_check_early_stop:
                 bmp_printf( FONT_MED, 30, 110, 
                     "Slot %d: frame %d not saved ", slot_index, slots[slot_index].frame_number
                 );
-                beep();
+                /* uncompressed slot must not reach the size assert below */
+                if (slots[slot_index].status != SLOT_FREE)
+                {
+                    free_slot(slot_index);
+                }
+                continue;
             }
 
             /* video frame consistency checks only for VIDF */
