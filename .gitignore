@@ -1,0 +1,7 @@
+# Rebuild leftovers. The camera loads .mo modules, not these.
+*.o
+*.d
+*.dep
+*.sym
+hgstamp
+hgdiff.tmp
