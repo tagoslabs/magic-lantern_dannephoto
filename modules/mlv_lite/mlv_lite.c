@@ -3340,16 +3340,6 @@ int write_frames(FILE** pf, void* ptr, int group_size, int num_frames, int threa
 
 extern thunk ErrCardForLVApp_handler;
 
-extern int lv_movie_select;
-
-/* 5D3 1.2.3 GUI_SetLvMode. Writes the photo/movie value Canon actually uses.
- * A bare property write is overwritten from the old cached value. */
-static void canon_gui_set_lv_mode(int mode)
-{
-    void (*set_lv_mode)(int) = (void *) 0xFF198400;
-    set_lv_mode(mode);
-}
-
 /* One frame through the lossless encoder. 0 if it failed. */
 static int encoder_probe_ok(void)
 {
@@ -3372,45 +3362,6 @@ static int encoder_probe_ok(void)
     if (slots[0].status != SLOT_FREE)
         free_slot(0);
     return ok;
-}
-
-/* Ask Canon to leave movie LiveView and enter it again, the same call the
- * photo/movie control ends up in. Returns 1 if movie LiveView came back.
- * Does not press PLAY: that only opens the playback playlist. */
-static int bounce_movie_select(void)
-{
-    if (!cam_5d3_123 || lv_movie_select != LVMS_ENABLE_MOVIE || !lv)
-        return 0;
-
-    bmp_printf(FONT_MED, 30, 50, "USB: re-entering movie mode...    ");
-    movie_lv_busy = 1;
-
-    /* Canon needs this memory for the JPEG suite. */
-    take_semaphore(settings_sem, 0);
-    free_buffers();
-    give_semaphore(settings_sem);
-
-    canon_gui_set_lv_mode(1);
-    for (int i = 0; i < 30 && lv_movie_select == LVMS_ENABLE_MOVIE; i++)
-        msleep(50);
-
-    if (lv_movie_select == LVMS_ENABLE_MOVIE)
-    {
-        /* Switch stayed on movie and Canon kept the old value. */
-        canon_gui_set_lv_mode(LVMS_ENABLE_MOVIE);
-        movie_lv_busy = 0;
-        return 0;
-    }
-
-    msleep(500);
-    canon_gui_set_lv_mode(LVMS_ENABLE_MOVIE);
-    for (int i = 0; i < 40 && !(lv && is_movie_mode()); i++)
-        msleep(50);
-    if (lv && is_movie_mode())
-        wait_lv_frames(8);
-
-    movie_lv_busy = 0;
-    return lv && is_movie_mode();
 }
 
 static void abort_recording_early(void)
@@ -3526,35 +3477,14 @@ void raw_video_rec_task(uint32_t thread)
         setup_bit_depth();
         give_semaphore(settings_sem);
 
-        /* Gimbal USB leaves the JPEG engine uninitialized if movie LiveView
-         * came up with the cable already in. Re-enter movie LiveView once. */
+        /* USB already connected at movie-mode entry leaves the JPEG suite
+         * empty. Do not call back into Canon from here: that races the PTP
+         * task and hangs the camera. The photo/movie lever still rebuilds it. */
         if (OUTPUT_COMPRESSION && cam_5d3 && !encoder_probe_ok())
         {
-            if (!bounce_movie_select())
-            {
-                NotifyBox(8000, "Encoder failed (%d). Switch Photo, then Movie.", compress_fail_code);
-                abort_recording_early();
-                return;
-            }
-            raw_set_dirty();
-            if (!raw_update_params())
-            {
-                NotifyBox(5000, "Raw detect error");
-                abort_recording_early();
-                return;
-            }
-            take_semaphore(settings_sem, 0);
-            realloc_buffers();
-            update_resolution_params();
-            setup_buffers();
-            setup_bit_depth();
-            give_semaphore(settings_sem);
-            if (!encoder_probe_ok())
-            {
-                NotifyBox(8000, "Encoder failed (%d). Switch Photo, then Movie.", compress_fail_code);
-                abort_recording_early();
-                return;
-            }
+            NotifyBox(8000, "Encoder failed (%d). Switch Photo, then Movie.", compress_fail_code);
+            abort_recording_early();
+            return;
         }
 
         /* create output file */
