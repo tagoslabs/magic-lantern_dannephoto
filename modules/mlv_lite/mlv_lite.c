@@ -326,6 +326,9 @@ static GUARDED_BY(GuiMainTask)  int frame_offset_delta_y = 0;
 
 static volatile int raw_recording_state = RAW_IDLE;
 
+/* Non-zero while a USB host (the gimbal) is attached. */
+PROP_INT(PROP_USBDEVICE_CONNECT, mlv_usb_connect);
+
 #define RAW_IS_IDLE      (raw_recording_state == RAW_IDLE)
 #define RAW_IS_PREPARING (raw_recording_state == RAW_PREPARING)
 #define RAW_IS_RECORDING (raw_recording_state == RAW_RECORDING || \
@@ -3340,6 +3343,120 @@ int write_frames(FILE** pf, void* ptr, int group_size, int num_frames, int threa
 
 extern thunk ErrCardForLVApp_handler;
 
+/*
+ * 5D3 1.2.3. evfPrepareChangeVdInterrupt cancels VramStage (input 3) and
+ * never starts it again. The photo/movie lever works because standby plus a
+ * new movie entry builds a fresh stage. Queue that second start on the VRAM
+ * task: input 4 returns state 4 to 0, then two input 0s init and allocate.
+ * Do not call the state handlers from here.
+ */
+#define VRAM_STAGE_PTR   0x26430
+#define TRY_POST_EVENT   0x17D54
+#define EVF_VD_CHANGE    0xFF16CFF8
+#define EVF_VD_CHANGE_INSN 0xE5970000 /* ldr r0, [r7] */
+
+static volatile int vram_vd_changed = 0;
+static volatile int vram_usb_run = 1;
+static int vram_hook_on = 0;
+static int vram_fix_attempts = 0;
+
+static int vram_stage_state(uint32_t *task, uint32_t *ctrl_out)
+{
+    uint32_t ctrl = *(volatile uint32_t *)VRAM_STAGE_PTR;
+    if (ctrl < 0x1000)
+        return -1;
+    uint32_t t = *(volatile uint32_t *)(ctrl + 4);
+    uint32_t st = *(volatile uint32_t *)(ctrl + 8);
+    uint32_t q = *(volatile uint32_t *)(ctrl + 0x10);
+    if (!t || !st || !q)
+        return -1;
+    uint32_t state = *(volatile uint32_t *)(st + 0x1c);
+    if (state > 4)
+        return -1;
+    *task = t;
+    *ctrl_out = ctrl;
+    return (int)state;
+}
+
+static int vram_post(uint32_t task, uint32_t ctrl, uint32_t event)
+{
+    int (*post)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) = (void *)TRY_POST_EVENT;
+    return (post(task, ctrl, event, 0, 0) & 1) == 0;
+}
+
+static void vram_kick(uint32_t task, uint32_t ctrl)
+{
+    if (!vram_post(task, ctrl, 4))
+        return;
+    if (!vram_post(task, ctrl, 0))
+        return;
+    vram_post(task, ctrl, 0);
+}
+
+static void evf_vd_change_cbr(uint32_t *regs, uint32_t *stack, uint32_t pc)
+{
+    (void)regs; (void)stack; (void)pc;
+    vram_vd_changed = 1;
+}
+
+static void vram_usb_task(void *unused)
+{
+    int stuck_in_4 = 0;
+    (void)unused;
+
+    while (vram_usb_run)
+    {
+        uint32_t task = 0;
+        uint32_t ctrl = 0;
+        int requested;
+        int state;
+
+        msleep(100);
+        if (!cam_5d3_123)
+            continue;
+
+        requested = vram_vd_changed;
+        if (!mlv_usb_connect || !is_movie_mode() || !RAW_IS_IDLE)
+        {
+            stuck_in_4 = 0;
+            continue;
+        }
+
+        state = vram_stage_state(&task, &ctrl);
+        if (state < 0)
+            continue;
+
+        if (requested)
+            vram_vd_changed = 0;
+
+        if (state == 4)
+            stuck_in_4++;
+        else
+            stuck_in_4 = 0;
+
+        if (state == 3 && !requested)
+        {
+            vram_fix_attempts = 0;
+            continue;
+        }
+
+        /* Request means the cancel is already queued. State 4 for a few
+         * ticks means that cancel landed and nothing started a new stage. */
+        if (!requested && stuck_in_4 < 3)
+            continue;
+        if (!requested && vram_fix_attempts >= 3)
+            continue;
+
+        if (requested)
+            vram_fix_attempts = 0;
+        printf("mlv_lite: VRAM restart from state %d\n", state);
+        vram_kick(task, ctrl);
+        vram_fix_attempts++;
+        stuck_in_4 = 0;
+        msleep(400);
+    }
+}
+
 /* One frame through the lossless encoder. 0 if it failed. */
 static int encoder_probe_ok(void)
 {
@@ -3477,12 +3594,13 @@ void raw_video_rec_task(uint32_t thread)
         setup_bit_depth();
         give_semaphore(settings_sem);
 
-        /* USB already connected at movie-mode entry leaves the JPEG suite
-         * empty. Do not call back into Canon from here: that races the PTP
-         * task and hangs the camera. The photo/movie lever still rebuilds it. */
+        /* Backstop if the VRAM restart queued by vram_usb_task did not
+         * fill the suite. Do not call Canon from this task. */
         if (OUTPUT_COMPRESSION && cam_5d3 && !encoder_probe_ok())
         {
-            NotifyBox(8000, "Encoder failed (%d). Switch Photo, then Movie.", compress_fail_code);
+            uint32_t task = 0, ctrl = 0;
+            int state = cam_5d3_123 ? vram_stage_state(&task, &ctrl) : -1;
+            NotifyBox(8000, "Encoder failed (%d) state %d. Switch Photo, then Movie.", compress_fail_code, state);
             abort_recording_early();
             return;
         }
@@ -4623,6 +4741,13 @@ static unsigned int raw_rec_init()
     cam_5d3_123 = is_camera("5D3",  "1.2.3");
     cam_5d3 = (cam_5d3_113 || cam_5d3_123);
 
+    if (cam_5d3_123)
+    {
+        if (!patch_hook_function(EVF_VD_CHANGE, EVF_VD_CHANGE_INSN, evf_vd_change_cbr, "mlv_lite: VD change"))
+            vram_hook_on = 1;
+        task_create("vram_usb", 0x1c, 0x800, vram_usb_task, (void *)0);
+    }
+
     if (is_dir("A:/") && is_dir("B:/") && cam_5d3) cam_dualcard = cam_5d3; /* Add any new models later */
     
     if (cam_5d2 || cam_50d)
@@ -4691,6 +4816,9 @@ static unsigned int raw_rec_init()
 
 static unsigned int raw_rec_deinit()
 {
+    vram_usb_run = 0;
+    if (vram_hook_on)
+        unpatch_memory(EVF_VD_CHANGE);
     return 0;
 }
 
