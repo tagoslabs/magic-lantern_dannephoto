@@ -379,6 +379,8 @@ static GUARDED_BY(LiveViewTask) int skipped_frames = 0;             /* how many 
 static GUARDED_BY(RawRecTask)   int chunk_frame_count[MAX_WRITER_THREADS] = {0};          /* how many frames in the current file chunk */
 static volatile                 int buffer_full = 0;                /* true when the memory becomes full */
 static volatile                 int compress_fail_code = 0;        /* lossless encoder error, 0 if none */
+static volatile                 int compress_probe = 0;            /* probe must not abort the recording */
+static volatile                 int movie_lv_busy = 0;             /* LiveView restart in progress */
        GUARDED_BY(RawRecTask)   char * raw_movie_filename;          /* file name for current (or last) movie */
 static GUARDED_BY(RawRecTask)   char chunk_filename[MAX_WRITER_THREADS][MAX_PATH];          /* file name for current movie chunk */
 static GUARDED_BY(RawRecTask)   int64_t written_total[MAX_WRITER_THREADS] = {0};          /* how many bytes we have written in this movie */
@@ -2771,9 +2773,10 @@ static void compress_task()
                 printf("Compression error %d at frame %d\n", compressed_size, frame_count-1);
                 DeleteMemorySuite(outSuite);
                 compress_fail_code = compressed_size;
-                buffer_full = 1;
                 /* size is still max_frame_size, so this returns the slot to FREE */
                 free_slot(slot_index);
+                if (!compress_probe)
+                    buffer_full = 1;
                 continue;
             }
 
@@ -3337,6 +3340,92 @@ int write_frames(FILE** pf, void* ptr, int group_size, int num_frames, int threa
 
 extern thunk ErrCardForLVApp_handler;
 
+extern int lv_movie_select;
+
+/* 5D3 1.2.3 GUI_SetLvMode. Writes the photo/movie value Canon actually uses.
+ * A bare property write is overwritten from the old cached value. */
+static void canon_gui_set_lv_mode(int mode)
+{
+    void (*set_lv_mode)(int) = (void *) 0xFF198400;
+    set_lv_mode(mode);
+}
+
+/* One frame through the lossless encoder. 0 if it failed. */
+static int encoder_probe_ok(void)
+{
+    if (!compress_mq || !OUTPUT_COMPRESSION || !slots[0].ptr || !fullsize_buffers[1])
+        return 0;
+
+    compress_fail_code = 0;
+    compress_probe = 1;
+    slots[0].status = SLOT_CAPTURING;
+    msg_queue_post(compress_mq, INT_MAX);
+    msg_queue_post(compress_mq, 1 << 16);
+
+    for (int i = 0; i < 100 && slots[0].status == SLOT_CAPTURING; i++)
+        msleep(10);
+
+    compress_probe = 0;
+    msg_queue_post(compress_mq, INT_MIN);
+
+    int ok = (compress_fail_code == 0 && slots[0].status == SLOT_FULL);
+    if (slots[0].status != SLOT_FREE)
+        free_slot(0);
+    return ok;
+}
+
+/* Ask Canon to leave movie LiveView and enter it again, the same call the
+ * photo/movie control ends up in. Returns 1 if movie LiveView came back.
+ * Does not press PLAY: that only opens the playback playlist. */
+static int bounce_movie_select(void)
+{
+    if (!cam_5d3_123 || lv_movie_select != LVMS_ENABLE_MOVIE || !lv)
+        return 0;
+
+    bmp_printf(FONT_MED, 30, 50, "USB: re-entering movie mode...    ");
+    movie_lv_busy = 1;
+
+    /* Canon needs this memory for the JPEG suite. */
+    take_semaphore(settings_sem, 0);
+    free_buffers();
+    give_semaphore(settings_sem);
+
+    canon_gui_set_lv_mode(1);
+    for (int i = 0; i < 30 && lv_movie_select == LVMS_ENABLE_MOVIE; i++)
+        msleep(50);
+
+    if (lv_movie_select == LVMS_ENABLE_MOVIE)
+    {
+        /* Switch stayed on movie and Canon kept the old value. */
+        canon_gui_set_lv_mode(LVMS_ENABLE_MOVIE);
+        movie_lv_busy = 0;
+        return 0;
+    }
+
+    msleep(500);
+    canon_gui_set_lv_mode(LVMS_ENABLE_MOVIE);
+    for (int i = 0; i < 40 && !(lv && is_movie_mode()); i++)
+        msleep(50);
+    if (lv && is_movie_mode())
+        wait_lv_frames(8);
+
+    movie_lv_busy = 0;
+    return lv && is_movie_mode();
+}
+
+static void abort_recording_early(void)
+{
+    take_semaphore(settings_sem, 0);
+    free_buffers();
+    restore_bit_depth();
+    give_semaphore(settings_sem);
+    gui_uilock(UILOCK_NONE);
+    powersave_permit();
+    ResumeLiveView();
+    redraw();
+    raw_recording_state = RAW_IDLE;
+}
+
 /* note: called from raw_video_rec_task */
 /* vsync does not run at this time, so we can take its role momentarily */
 static REQUIRES(LiveViewTask)
@@ -3437,6 +3526,37 @@ void raw_video_rec_task(uint32_t thread)
         setup_bit_depth();
         give_semaphore(settings_sem);
 
+        /* Gimbal USB leaves the JPEG engine uninitialized if movie LiveView
+         * came up with the cable already in. Re-enter movie LiveView once. */
+        if (OUTPUT_COMPRESSION && cam_5d3 && !encoder_probe_ok())
+        {
+            if (!bounce_movie_select())
+            {
+                NotifyBox(8000, "Encoder failed (%d). Switch Photo, then Movie.", compress_fail_code);
+                abort_recording_early();
+                return;
+            }
+            raw_set_dirty();
+            if (!raw_update_params())
+            {
+                NotifyBox(5000, "Raw detect error");
+                abort_recording_early();
+                return;
+            }
+            take_semaphore(settings_sem, 0);
+            realloc_buffers();
+            update_resolution_params();
+            setup_buffers();
+            setup_bit_depth();
+            give_semaphore(settings_sem);
+            if (!encoder_probe_ok())
+            {
+                NotifyBox(8000, "Encoder failed (%d). Switch Photo, then Movie.", compress_fail_code);
+                abort_recording_early();
+                return;
+            }
+        }
+
         /* create output file */
         raw_movie_filename = get_next_raw_movie_file_name();
         strcpy(chunk_filename[thread], raw_movie_filename);
@@ -3486,6 +3606,8 @@ void raw_video_rec_task(uint32_t thread)
         {
             msleep(10);
         }
+        if (!RAW_IS_RECORDING)
+            return;
 
         get_next_chunk_file_name(raw_movie_filename, ++mlv_chunk, chunk_filename[thread], thread);
 
@@ -4212,6 +4334,24 @@ unsigned int raw_rec_keypress_cbr(unsigned int key)
     if (!is_movie_mode())
         return 1;
 
+    /* Gimbal REC and the LiveView button are the same code. While movie
+     * LiveView is still coming up, Canon starts a recording and asserts
+     * on the missing JPEG suite. Swallow the press until it is idle. */
+    int rec_key_pressed = (key == MODULE_KEY_LV || key == MODULE_KEY_REC);
+    if (cam_50d || cam_5d2) rec_key_pressed = (key == MODULE_KEY_PRESS_SET);
+    if (cam_5d3 && rec_key_pressed && !RAW_IS_RECORDING &&
+        (movie_lv_busy || RAW_IS_PREPARING || RAW_IS_FINISHING || (lv && !liveview_display_idle())))
+    {
+        static int last_wait_msg = 0;
+        int now = get_ms_clock();
+        if (now - last_wait_msg > 2000)
+        {
+            NotifyBox(1500, "Wait for movie mode.");
+            last_wait_msg = now;
+        }
+        return 0;
+    }
+
     /* keys are only hooked in LiveView */
     if (!liveview_display_idle() && !RECORDING_RAW)
         return 1;
@@ -4225,11 +4365,6 @@ unsigned int raw_rec_keypress_cbr(unsigned int key)
         return 0;
 
     /* start/stop recording with the LiveView key */
-    int rec_key_pressed = (key == MODULE_KEY_LV || key == MODULE_KEY_REC);
-    
-    /* ... or SET on 5D2/50D */
-    if (cam_50d || cam_5d2) rec_key_pressed = (key == MODULE_KEY_PRESS_SET);
-    
     if (rec_key_pressed)
     {
         printf("REC key pressed.\n");
