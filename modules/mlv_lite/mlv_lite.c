@@ -3352,6 +3352,7 @@ extern thunk ErrCardForLVApp_handler;
  */
 #define VRAM_STAGE_PTR   0x26430
 #define TRY_POST_EVENT   0x17D54
+#define VRAM_GET_JOB     0xFF485764
 #define EVF_VD_CHANGE    0xFF16CFF8
 #define EVF_VD_CHANGE_INSN 0xE5970000 /* ldr r0, [r7] */
 
@@ -3393,6 +3394,30 @@ static void vram_kick(uint32_t task, uint32_t ctrl)
     vram_post(task, ctrl, 0);
 }
 
+/* 1 only when the current job is readable and its suite pointer is 0.
+ * FF485764 writes the caller's pointer and does not dequeue. */
+static int vram_suite_is_empty(uint32_t ctrl)
+{
+    uint32_t queue = *(volatile uint32_t *)(ctrl + 0x10);
+    uint32_t job = 0;
+    int (*get_job)(uint32_t, uint32_t *) = (void *)VRAM_GET_JOB;
+
+    if (!queue || (get_job(queue, &job) & 1) || job < 0x1000)
+        return 0;
+    return *(volatile uint32_t *)(job + 0x7c) == 0;
+}
+
+/* State 3 ignores inputs 4 and 0. Input 3 leaves it, and the following
+ * 4,0,0 is the same restart as everywhere else. +0x78 makes that alloc
+ * request a suite instead of publishing another empty one. */
+static void vram_kick_empty(uint32_t task, uint32_t ctrl)
+{
+    *(volatile uint32_t *)(ctrl + 0x78) = 1;
+    if (!vram_post(task, ctrl, 3))
+        return;
+    vram_kick(task, ctrl);
+}
+
 static void evf_vd_change_cbr(uint32_t *regs, uint32_t *stack, uint32_t pc)
 {
     (void)regs; (void)stack; (void)pc;
@@ -3402,6 +3427,7 @@ static void evf_vd_change_cbr(uint32_t *regs, uint32_t *stack, uint32_t pc)
 static void vram_usb_task(void *unused)
 {
     int stuck_in_4 = 0;
+    int stuck_empty = 0;
     (void)unused;
 
     while (vram_usb_run)
@@ -3410,6 +3436,7 @@ static void vram_usb_task(void *unused)
         uint32_t ctrl = 0;
         int requested;
         int state;
+        int empty = 0;
 
         msleep(100);
         if (!cam_5d3_123)
@@ -3419,6 +3446,7 @@ static void vram_usb_task(void *unused)
         if (!mlv_usb_connect || !is_movie_mode() || !RAW_IS_IDLE)
         {
             stuck_in_4 = 0;
+            stuck_empty = 0;
             continue;
         }
 
@@ -3434,15 +3462,27 @@ static void vram_usb_task(void *unused)
         else
             stuck_in_4 = 0;
 
-        if (state == 3 && !requested)
+        if (state == 3)
+            empty = vram_suite_is_empty(ctrl);
+
+        /* A live state 3 is the encoder that just recorded. An empty one
+         * ignores the normal restart, so it has its own kick below. */
+        if (state == 3 && empty)
+            stuck_empty++;
+        else
+            stuck_empty = 0;
+
+        if (state == 3 && !empty && !requested)
         {
             vram_fix_attempts = 0;
             continue;
         }
+        if (state == 3 && empty && !requested && stuck_empty < 3)
+            continue;
 
         /* Request means the cancel is already queued. State 4 for a few
          * ticks means that cancel landed and nothing started a new stage. */
-        if (!requested && stuck_in_4 < 3)
+        if (!requested && state != 3 && stuck_in_4 < 3)
             continue;
         if (!requested && vram_fix_attempts >= 3)
             continue;
@@ -3450,7 +3490,10 @@ static void vram_usb_task(void *unused)
         if (requested)
             vram_fix_attempts = 0;
         printf("mlv_lite: VRAM restart from state %d\n", state);
-        vram_kick(task, ctrl);
+        if (state == 3 && empty)
+            vram_kick_empty(task, ctrl);
+        else
+            vram_kick(task, ctrl);
         vram_fix_attempts++;
         stuck_in_4 = 0;
         msleep(400);
